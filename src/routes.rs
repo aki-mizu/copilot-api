@@ -22,7 +22,7 @@ use crate::{
     error::ApiError,
     openai::{
         ChatCompletionRequest, HealthResponse, ModelListResponse, ModelResponse, compile_prompt,
-        normalize_tools,
+        normalize_reasoning_effort, normalize_tools,
     },
 };
 
@@ -119,6 +119,8 @@ async fn chat_completions(
     let Json(request) = request.map_err(|error| ApiError::invalid_request(error.to_string()))?;
     validate_request(&request)?;
     let tools = normalize_tools(request.tools.as_deref()).map_err(ApiError::invalid_request)?;
+    let reasoning_effort = normalize_reasoning_effort(request.reasoning_effort.as_deref())
+        .map_err(ApiError::invalid_request)?;
 
     let model = request
         .model
@@ -132,9 +134,27 @@ async fn chat_completions(
     let created = unix_timestamp();
 
     if request.stream {
-        stream_chat_completion(state, model, prompt_parts, completion_id, created, &tools).await
+        stream_chat_completion(
+            state,
+            model,
+            prompt_parts,
+            completion_id,
+            created,
+            reasoning_effort,
+            &tools,
+        )
+        .await
     } else {
-        complete_chat_completion(state, model, prompt_parts, completion_id, created, &tools).await
+        complete_chat_completion(
+            state,
+            model,
+            prompt_parts,
+            completion_id,
+            created,
+            reasoning_effort,
+            &tools,
+        )
+        .await
     }
 }
 

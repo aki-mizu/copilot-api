@@ -14,7 +14,25 @@ pub(crate) struct ChatCompletionRequest {
     #[serde(default)]
     pub(crate) n: Option<u32>,
     #[serde(default)]
+    pub(crate) reasoning_effort: Option<String>,
+    #[serde(default)]
     pub(crate) tools: Option<Vec<OpenAiTool>>,
+}
+
+pub(crate) fn normalize_reasoning_effort(
+    reasoning_effort: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(reasoning_effort) = reasoning_effort else {
+        return Ok(None);
+    };
+
+    let reasoning_effort = reasoning_effort.trim().to_ascii_lowercase();
+    match reasoning_effort.as_str() {
+        "none" | "low" | "medium" | "high" | "xhigh" | "max" => Ok(Some(reasoning_effort)),
+        _ => {
+            Err("reasoning_effort must be one of: none, low, medium, high, xhigh, max".to_string())
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -434,6 +452,16 @@ mod tests {
         .expect("content should be supported");
 
         assert_eq!(content, "hello world");
+    }
+
+    #[test]
+    fn normalizes_supported_reasoning_effort() {
+        assert_eq!(
+            normalize_reasoning_effort(Some(" HIGH ")),
+            Ok(Some("high".to_string()))
+        );
+        assert_eq!(normalize_reasoning_effort(None), Ok(None));
+        assert!(normalize_reasoning_effort(Some("extra-high")).is_err());
     }
 
     #[test]

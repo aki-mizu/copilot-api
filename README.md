@@ -61,6 +61,8 @@ If you keep the GHCR package private, add `ghcr.io` as a registry in Portainer w
 
 `POST /v1/chat/completions` accepts the OpenAI Chat Completions message format, including `stream: true` for Server-Sent Events.
 
+For reasoning-capable Copilot models, requests may also specify `reasoning_effort` as one of `none`, `low`, `medium`, `high`, `xhigh`, or `max`. Unsupported models may ignore the setting.
+
 ```bash
 curl http://127.0.0.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \

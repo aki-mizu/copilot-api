@@ -35,9 +35,17 @@ pub(crate) async fn complete_chat_completion(
     prompt_parts: PromptParts,
     completion_id: String,
     created: u64,
+    reasoning_effort: Option<String>,
     tools: &[ToolDefinition],
 ) -> Result<Response, ApiError> {
-    let session = create_session(&state, &model, &prompt_parts, false).await?;
+    let session = create_session(
+        &state,
+        &model,
+        &prompt_parts,
+        false,
+        reasoning_effort.as_deref(),
+    )
+    .await?;
     let result = session
         .send_and_wait(
             MessageOptions::new(prompt_parts.prompt)
@@ -90,6 +98,7 @@ pub(crate) async fn stream_chat_completion(
     prompt_parts: PromptParts,
     completion_id: String,
     created: u64,
+    reasoning_effort: Option<String>,
     tools: &[ToolDefinition],
 ) -> Result<Response, ApiError> {
     if !tools.is_empty() {
@@ -99,12 +108,18 @@ pub(crate) async fn stream_chat_completion(
             prompt_parts,
             completion_id,
             created,
+            reasoning_effort,
             tools,
         )
         .await;
     }
 
-    let config = session_config(&model, prompt_parts.system_message.clone(), true);
+    let config = session_config(
+        &model,
+        prompt_parts.system_message.clone(),
+        true,
+        reasoning_effort.as_deref(),
+    );
     let prepared = state
         .client
         .prepare_session(config)
@@ -139,9 +154,17 @@ async fn stream_tool_chat_completion(
     prompt_parts: PromptParts,
     completion_id: String,
     created: u64,
+    reasoning_effort: Option<String>,
     tools: &[ToolDefinition],
 ) -> Result<Response, ApiError> {
-    let session = create_session(&state, &model, &prompt_parts, false).await?;
+    let session = create_session(
+        &state,
+        &model,
+        &prompt_parts,
+        false,
+        reasoning_effort.as_deref(),
+    )
+    .await?;
     let (sender, receiver) = mpsc::channel(32);
     let timeout = state.config.request_timeout;
     let prompt = prompt_parts.prompt;
@@ -389,6 +412,7 @@ async fn create_session(
     model: &str,
     prompt_parts: &PromptParts,
     streaming: bool,
+    reasoning_effort: Option<&str>,
 ) -> Result<Session, ApiError> {
     state
         .client
@@ -396,12 +420,18 @@ async fn create_session(
             model,
             prompt_parts.system_message.clone(),
             streaming,
+            reasoning_effort,
         ))
         .await
         .map_err(ApiError::upstream)
 }
 
-fn session_config(model: &str, system_message: Option<String>, streaming: bool) -> SessionConfig {
+fn session_config(
+    model: &str,
+    system_message: Option<String>,
+    streaming: bool,
+    reasoning_effort: Option<&str>,
+) -> SessionConfig {
     let mut config = SessionConfig::default()
         .with_model(model)
         .with_client_name(SERVICE_NAME)
@@ -411,8 +441,23 @@ fn session_config(model: &str, system_message: Option<String>, streaming: bool) 
     if let Some(content) = system_message {
         config = config.with_system_message(SystemMessageConfig::new().with_content(content));
     }
+    if let Some(reasoning_effort) = reasoning_effort {
+        config = config.with_reasoning_effort(reasoning_effort);
+    }
 
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_config_forwards_reasoning_effort() {
+        let config = session_config("gpt-5", None, true, Some("high"));
+
+        assert_eq!(config.reasoning_effort.as_deref(), Some("high"));
+    }
 }
 
 async fn send_sse_json<T: Serialize>(
