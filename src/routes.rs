@@ -13,6 +13,7 @@ use axum::{
 };
 use github_copilot_sdk::Client;
 use subtle::ConstantTimeEq;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -72,15 +73,43 @@ async fn health() -> Json<HealthResponse> {
 }
 
 async fn list_models(State(state): State<AppState>) -> Json<ModelListResponse> {
-    Json(ModelListResponse {
+    let available_models = match state.client.list_models().await {
+        Ok(models) => models.into_iter().map(|model| model.id).collect(),
+        Err(error) => {
+            warn!(%error, "could not list available Copilot models; returning the configured default");
+            Vec::new()
+        }
+    };
+
+    Json(model_list_response(
+        &state.config.default_model,
+        available_models,
+    ))
+}
+
+fn model_list_response(
+    default_model: &str,
+    available_models: impl IntoIterator<Item = String>,
+) -> ModelListResponse {
+    let mut model_ids = vec![default_model.to_string()];
+    for model_id in available_models {
+        if !model_id.trim().is_empty() && !model_ids.iter().any(|id| id == &model_id) {
+            model_ids.push(model_id);
+        }
+    }
+
+    ModelListResponse {
         object: "list",
-        data: vec![ModelResponse {
-            id: state.config.default_model.clone(),
-            object: "model",
-            created: 0,
-            owned_by: "github-copilot",
-        }],
-    })
+        data: model_ids
+            .into_iter()
+            .map(|id| ModelResponse {
+                id,
+                object: "model",
+                created: 0,
+                owned_by: "github-copilot",
+            })
+            .collect(),
+    }
 }
 
 async fn chat_completions(
@@ -126,4 +155,29 @@ fn unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lists_default_then_unique_discovered_models() {
+        let response = model_list_response(
+            "auto",
+            [
+                "gpt-5".to_string(),
+                "auto".to_string(),
+                "claude-sonnet-4".to_string(),
+                "gpt-5".to_string(),
+                "".to_string(),
+            ],
+        );
+        let data = serde_json::to_value(response).expect("model list should serialize");
+
+        assert_eq!(data["data"][0]["id"], "auto");
+        assert_eq!(data["data"][1]["id"], "gpt-5");
+        assert_eq!(data["data"][2]["id"], "claude-sonnet-4");
+        assert_eq!(data["data"].as_array().map(Vec::len), Some(3));
+    }
 }

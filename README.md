@@ -57,7 +57,7 @@ If you keep the GHCR package private, add `ghcr.io` as a registry in Portainer w
 
 `GET /health` reports process health.
 
-`GET /v1/models` advertises the configured default model.
+`GET /v1/models` lists the configured default first, followed by models available to the authenticated Copilot account. Use one of those IDs in the `model` field of a chat-completions request; Open WebUI can use this endpoint to populate its model selector.
 
 `POST /v1/chat/completions` accepts the OpenAI Chat Completions message format, including `stream: true` for Server-Sent Events.
 
