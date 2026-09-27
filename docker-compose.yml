@@ -1,9 +1,7 @@
 services:
   copilot-openai-api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: copilot-openai-api:latest
+  image: "${GHCR_IMAGE:-ghcr.io/aki-mizu/copilot-api:latest}"
+  pull_policy: always
     restart: unless-stopped
     init: true
     ports:

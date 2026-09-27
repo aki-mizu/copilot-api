@@ -29,7 +29,7 @@ For a network-accessible deployment, set `API_KEY` and a non-loopback `HOST` exp
 
 ## Deploy With Portainer
 
-[`docker-compose.yml`](docker-compose.yml) builds the included [`Dockerfile`](Dockerfile) and is intended for a Docker Standalone environment. Deploy it through **Stacks** > **Add stack** > **Git Repository**, with `docker-compose.yml` as the Compose path. A web-editor or upload-only stack has no source build context; build and publish the image first if you use either of those paths.
+ [`docker-compose.yml`](docker-compose.yml) pulls the prebuilt GHCR image and is intended for a Docker Standalone environment. Deploy it through **Stacks** > **Add stack** > **Git Repository**, with `docker-compose.yml` as the Compose path.
 
 Set these stack environment variables in Portainer instead of committing a `.env` file:
 
@@ -47,7 +47,7 @@ The container runs as an unprivileged user and keeps the downloaded Copilot runt
 
 Pushing to `main`, pushing a `v*` semantic-version tag, or manually running [`.github/workflows/publish-image.yml`](.github/workflows/publish-image.yml) publishes an image to `ghcr.io/aki-mizu/copilot-api`. The workflow uses the repository `GITHUB_TOKEN`; no registry credential is stored in this repository.
 
-For Portainer to pull the published image, deploy [`docker-compose.ghcr.yml`](docker-compose.ghcr.yml) as the Compose path and set the same stack variables listed above. `GHCR_IMAGE` defaults to `ghcr.io/aki-mizu/copilot-api:latest`; set it to a versioned tag such as `ghcr.io/aki-mizu/copilot-api:1.2.3` to pin a deployment.
+For Portainer to pull the published image, deploy [`docker-compose.yml`](docker-compose.yml) and set the same stack variables listed above. `GHCR_IMAGE` defaults to `ghcr.io/aki-mizu/copilot-api:latest`; set it to a versioned tag such as `ghcr.io/aki-mizu/copilot-api:1.2.3` to pin a deployment.
 
 The image is linked to this repository, so it inherits repository access permissions. Package visibility is separate: a first GHCR publish is private even when the repository is public. To allow Portainer to pull it without registry credentials, open the package's **Package settings**, choose **Change visibility**, and select **Public**. GitHub does not allow a public package to become private again.
 
