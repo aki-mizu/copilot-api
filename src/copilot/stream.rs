@@ -1,195 +1,18 @@
 use std::{convert::Infallible, time::Duration};
 
-use axum::{
-    Json,
-    response::{
-        IntoResponse, Response,
-        sse::{Event, KeepAlive, Sse},
-    },
-};
-use github_copilot_sdk::{
-    MessageOptions, SessionConfig, SystemMessageConfig, session::Session,
-    subscription::EventSubscription,
-};
+use axum::response::sse::Event;
+use github_copilot_sdk::{MessageOptions, session::Session, subscription::EventSubscription};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::error;
 
-use crate::{
-    error::ApiError,
-    openai::{
-        AssistantDelta, AssistantMessage, AssistantToolCall, ChatCompletionChoice,
-        ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionResponse, PromptParts,
-        ToolDefinition, assistant_content, parse_tool_calls, tool_call_deltas,
-    },
-    routes::AppState,
+use crate::openai::{
+    AssistantDelta, AssistantToolCall, ChatCompletionChunk, ChatCompletionChunkChoice,
+    ToolDefinition, assistant_content, parse_tool_calls, tool_call_deltas,
 };
 
-const SERVICE_NAME: &str = "copilot-openai-api";
-
-pub(crate) async fn complete_chat_completion(
-    state: AppState,
-    model: String,
-    prompt_parts: PromptParts,
-    completion_id: String,
-    created: u64,
-    reasoning_effort: Option<String>,
-    tools: &[ToolDefinition],
-) -> Result<Response, ApiError> {
-    let session = create_session(
-        &state,
-        &model,
-        &prompt_parts,
-        false,
-        reasoning_effort.as_deref(),
-    )
-    .await?;
-    let result = session
-        .send_and_wait(
-            MessageOptions::new(prompt_parts.prompt)
-                .with_wait_timeout(state.config.request_timeout),
-        )
-        .await;
-    let _ = session.disconnect().await;
-
-    let event = match result {
-        Ok(Some(event)) => event,
-        Ok(None) => {
-            return Err(ApiError::upstream(
-                "Copilot finished without an assistant response",
-            ));
-        }
-        Err(error) if error.to_string().contains("Timeout") => return Err(ApiError::timeout()),
-        Err(error) => return Err(ApiError::upstream(error)),
-    };
-    let content = assistant_content(&event.data).ok_or_else(|| {
-        ApiError::upstream("Copilot returned an assistant message without textual content")
-    })?;
-    let tool_calls = parse_tool_calls(&content, tools);
-    let finish_reason = if tool_calls.is_some() {
-        "tool_calls"
-    } else {
-        "stop"
-    };
-
-    Ok(Json(ChatCompletionResponse {
-        id: completion_id,
-        object: "chat.completion",
-        created,
-        model,
-        choices: vec![ChatCompletionChoice {
-            index: 0,
-            message: AssistantMessage {
-                role: "assistant",
-                content: tool_calls.is_none().then_some(content),
-                tool_calls,
-            },
-            finish_reason,
-        }],
-    })
-    .into_response())
-}
-
-pub(crate) async fn stream_chat_completion(
-    state: AppState,
-    model: String,
-    prompt_parts: PromptParts,
-    completion_id: String,
-    created: u64,
-    reasoning_effort: Option<String>,
-    tools: &[ToolDefinition],
-) -> Result<Response, ApiError> {
-    if !tools.is_empty() {
-        return stream_tool_chat_completion(
-            state,
-            model,
-            prompt_parts,
-            completion_id,
-            created,
-            reasoning_effort,
-            tools,
-        )
-        .await;
-    }
-
-    let config = session_config(
-        &model,
-        prompt_parts.system_message.clone(),
-        true,
-        reasoning_effort.as_deref(),
-    );
-    let prepared = state
-        .client
-        .prepare_session(config)
-        .map_err(ApiError::upstream)?;
-    let events = prepared.subscribe();
-    let session = prepared.start().await.map_err(ApiError::upstream)?;
-    let (sender, receiver) = mpsc::channel(32);
-    let timeout = state.config.request_timeout;
-
-    tokio::spawn(async move {
-        stream_session(
-            session,
-            events,
-            sender,
-            model,
-            prompt_parts.prompt,
-            completion_id,
-            created,
-            timeout,
-        )
-        .await;
-    });
-
-    Ok(Sse::new(ReceiverStream::new(receiver))
-        .keep_alive(KeepAlive::default())
-        .into_response())
-}
-
-async fn stream_tool_chat_completion(
-    state: AppState,
-    model: String,
-    prompt_parts: PromptParts,
-    completion_id: String,
-    created: u64,
-    reasoning_effort: Option<String>,
-    tools: &[ToolDefinition],
-) -> Result<Response, ApiError> {
-    let session = create_session(
-        &state,
-        &model,
-        &prompt_parts,
-        false,
-        reasoning_effort.as_deref(),
-    )
-    .await?;
-    let (sender, receiver) = mpsc::channel(32);
-    let timeout = state.config.request_timeout;
-    let prompt = prompt_parts.prompt;
-    let tools = tools.to_vec();
-
-    tokio::spawn(async move {
-        stream_tool_session(
-            session,
-            sender,
-            model,
-            prompt,
-            completion_id,
-            created,
-            timeout,
-            tools,
-        )
-        .await;
-    });
-
-    Ok(Sse::new(ReceiverStream::new(receiver))
-        .keep_alive(KeepAlive::default())
-        .into_response())
-}
-
-async fn stream_session(
+pub(super) async fn stream_session(
     session: Session,
     mut events: EventSubscription,
     sender: mpsc::Sender<Result<Event, Infallible>>,
@@ -306,7 +129,7 @@ async fn stream_session(
     let _ = session.disconnect().await;
 }
 
-async fn stream_tool_session(
+pub(super) async fn stream_tool_session(
     session: Session,
     sender: mpsc::Sender<Result<Event, Infallible>>,
     model: String,
@@ -405,59 +228,6 @@ async fn stream_tool_session(
     }
 
     let _ = sender.send(Ok(Event::default().data("[DONE]"))).await;
-}
-
-async fn create_session(
-    state: &AppState,
-    model: &str,
-    prompt_parts: &PromptParts,
-    streaming: bool,
-    reasoning_effort: Option<&str>,
-) -> Result<Session, ApiError> {
-    state
-        .client
-        .create_session(session_config(
-            model,
-            prompt_parts.system_message.clone(),
-            streaming,
-            reasoning_effort,
-        ))
-        .await
-        .map_err(ApiError::upstream)
-}
-
-fn session_config(
-    model: &str,
-    system_message: Option<String>,
-    streaming: bool,
-    reasoning_effort: Option<&str>,
-) -> SessionConfig {
-    let mut config = SessionConfig::default()
-        .with_model(model)
-        .with_client_name(SERVICE_NAME)
-        .with_streaming(streaming)
-        .deny_all_permissions();
-
-    if let Some(content) = system_message {
-        config = config.with_system_message(SystemMessageConfig::new().with_content(content));
-    }
-    if let Some(reasoning_effort) = reasoning_effort {
-        config = config.with_reasoning_effort(reasoning_effort);
-    }
-
-    config
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn session_config_forwards_reasoning_effort() {
-        let config = session_config("gpt-5", None, true, Some("high"));
-
-        assert_eq!(config.reasoning_effort.as_deref(), Some("high"));
-    }
 }
 
 async fn send_sse_json<T: Serialize>(
