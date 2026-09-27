@@ -1,7 +1,7 @@
 services:
   copilot-openai-api:
-  image: "${GHCR_IMAGE:-ghcr.io/aki-mizu/copilot-api:latest}"
-  pull_policy: always
+    image: "${GHCR_IMAGE:-ghcr.io/aki-mizu/copilot-api:latest}"
+    pull_policy: always
     restart: unless-stopped
     init: true
     ports:
