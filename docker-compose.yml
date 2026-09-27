@@ -5,10 +5,10 @@ services:
     restart: unless-stopped
     init: true
     ports:
-      - "${PUBLISHED_PORT:-3000}:3000"
+      - "${PUBLISHED_PORT:-3004}:3004"
     environment:
       HOST: "0.0.0.0"
-      PORT: "3000"
+      PORT: "3004"
       API_KEY: "${API_KEY:?Set API_KEY in Portainer before deploying}"
       COPILOT_GITHUB_TOKEN: "${COPILOT_GITHUB_TOKEN:?Set COPILOT_GITHUB_TOKEN in Portainer before deploying}"
       DEFAULT_MODEL: "${DEFAULT_MODEL:-auto}"

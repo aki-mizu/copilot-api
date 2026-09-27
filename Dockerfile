@@ -27,12 +27,12 @@ WORKDIR /var/lib/copilot
 ENV HOME=/var/lib/copilot \
     COPILOT_HOME=/var/lib/copilot \
     HOST=0.0.0.0 \
-    PORT=3000 \
+    PORT=3004 \
     RUST_LOG=info
 
-EXPOSE 3000
+EXPOSE 3004
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=2m --retries=3 \
-    CMD curl --fail --silent http://127.0.0.1:3000/health || exit 1
+    CMD curl --fail --silent "http://127.0.0.1:${PORT}/health" || exit 1
 
 ENTRYPOINT ["/usr/local/bin/copilot-openai-api"]
