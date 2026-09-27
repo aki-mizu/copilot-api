@@ -49,7 +49,9 @@ Pushing to `main`, pushing a `v*` semantic-version tag, or manually running [`.g
 
 For Portainer to pull the published image, deploy [`docker-compose.ghcr.yml`](docker-compose.ghcr.yml) as the Compose path and set the same stack variables listed above. `GHCR_IMAGE` defaults to `ghcr.io/aki-mizu/copilot-api:latest`; set it to a versioned tag such as `ghcr.io/aki-mizu/copilot-api:1.2.3` to pin a deployment.
 
-If the GHCR package is private, add `ghcr.io` as a registry in Portainer with credentials that have package read access, then select that registry for the stack. The Copilot token and API key remain stack environment variables, not registry credentials.
+The image is linked to this repository, so it inherits repository access permissions. Package visibility is separate: a first GHCR publish is private even when the repository is public. To allow Portainer to pull it without registry credentials, open the package's **Package settings**, choose **Change visibility**, and select **Public**. GitHub does not allow a public package to become private again.
+
+If you keep the GHCR package private, add `ghcr.io` as a registry in Portainer with credentials that have package read access, then select that registry for the stack. The Copilot token and API key remain stack environment variables, not registry credentials.
 
 ## API
 
