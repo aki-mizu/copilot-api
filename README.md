@@ -72,4 +72,4 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 
 When `API_KEY` is configured, add `-H "Authorization: Bearer $API_KEY"` to `/v1/*` calls.
 
-The initial surface intentionally supports text messages, one completion (`n: 1`), and streaming. Tool calling is rejected rather than silently exposing Copilot tools. Every session uses the SDK's deny-all permission policy, so this service does not approve filesystem, shell, browser, or MCP actions on behalf of an HTTP caller.
+The endpoint supports text messages, one completion (`n: 1`), streaming, and OpenAI `function` tools. Function declarations are passed to Copilot as client-side capabilities; when Copilot selects one, the API returns OpenAI-compatible `tool_calls` for Open WebUI or another client to execute. The service never executes caller-provided functions, and every Copilot session retains the SDK's deny-all permission policy for filesystem, shell, browser, and MCP actions. Tool-enabled SSE responses are buffered until the complete assistant response can be safely emitted as text or structured tool calls.

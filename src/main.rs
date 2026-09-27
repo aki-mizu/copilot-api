@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     convert::Infallible,
     env,
     net::SocketAddr,
@@ -90,13 +91,103 @@ struct ChatCompletionRequest {
     #[serde(default)]
     n: Option<u32>,
     #[serde(default)]
-    tools: Option<Value>,
+    tools: Option<Vec<OpenAiTool>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiTool {
+    #[serde(rename = "type")]
+    kind: String,
+    function: OpenAiFunction,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiFunction {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    parameters: Option<Value>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ToolDefinition {
+    name: String,
+    description: String,
+    parameters: Value,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatMessage {
     role: String,
     content: Option<Value>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<IncomingToolCall>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct IncomingToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    function: IncomingToolFunction,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct IncomingToolFunction {
+    name: String,
+    arguments: String,
+}
+
+fn normalize_tools(tools: Option<&[OpenAiTool]>) -> Result<Vec<ToolDefinition>, String> {
+    let Some(tools) = tools else {
+        return Ok(Vec::new());
+    };
+    if tools.len() > 64 {
+        return Err("tools must contain at most 64 definitions".to_string());
+    }
+
+    let mut names = HashSet::new();
+    tools
+        .iter()
+        .map(|tool| {
+            if tool.kind != "function" {
+                return Err("only tools with type `function` are supported".to_string());
+            }
+
+            let name = tool.function.name.trim();
+            if name.is_empty()
+                || name.len() > 64
+                || !name.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                })
+            {
+                return Err("tool function names must match [A-Za-z0-9_-]{1,64}".to_string());
+            }
+            if !names.insert(name.to_string()) {
+                return Err(format!("tool function `{name}` is defined more than once"));
+            }
+
+            let parameters = tool
+                .function
+                .parameters
+                .clone()
+                .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+            if parameters.get("type").and_then(Value::as_str) != Some("object") {
+                return Err(format!(
+                    "tool function `{name}` parameters must be a JSON schema with type `object`"
+                ));
+            }
+
+            Ok(ToolDefinition {
+                name: name.to_string(),
+                description: tool.function.description.clone().unwrap_or_default(),
+                parameters,
+            })
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -137,7 +228,32 @@ struct ChatCompletionChoice {
 #[derive(Serialize)]
 struct AssistantMessage {
     role: &'static str,
-    content: String,
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<AssistantToolCall>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AssistantToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: AssistantToolFunction,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AssistantToolFunction {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Serialize)]
+struct AssistantToolCallDelta {
+    index: usize,
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: AssistantToolFunction,
 }
 
 #[derive(Serialize)]
@@ -163,11 +279,69 @@ struct AssistantDelta {
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<AssistantToolCallDelta>>,
 }
 
 struct PromptParts {
     system_message: Option<String>,
     prompt: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolCallEnvelope {
+    tool_calls: Vec<RequestedToolCall>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestedToolCall {
+    name: String,
+    arguments: Value,
+}
+
+fn parse_tool_calls(content: &str, tools: &[ToolDefinition]) -> Option<Vec<AssistantToolCall>> {
+    if tools.is_empty() {
+        return None;
+    }
+
+    let envelope: ToolCallEnvelope = serde_json::from_str(content).ok()?;
+    if envelope.tool_calls.is_empty() || envelope.tool_calls.len() > 32 {
+        return None;
+    }
+
+    envelope
+        .tool_calls
+        .into_iter()
+        .map(|call| {
+            if !call.arguments.is_object() || !tools.iter().any(|tool| tool.name == call.name) {
+                return None;
+            }
+
+            Some(AssistantToolCall {
+                id: format!("call_{}", Uuid::new_v4().simple()),
+                kind: "function",
+                function: AssistantToolFunction {
+                    name: call.name,
+                    arguments: serde_json::to_string(&call.arguments).ok()?,
+                },
+            })
+        })
+        .collect()
+}
+
+fn tool_call_deltas(tool_calls: &[AssistantToolCall]) -> Vec<AssistantToolCallDelta> {
+    tool_calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| AssistantToolCallDelta {
+            index,
+            id: call.id.clone(),
+            kind: call.kind,
+            function: call.function.clone(),
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -361,6 +535,7 @@ async fn chat_completions(
 ) -> Result<Response, ApiError> {
     let Json(request) = request.map_err(|error| ApiError::invalid_request(error.to_string()))?;
     validate_request(&request)?;
+    let tools = normalize_tools(request.tools.as_deref()).map_err(ApiError::invalid_request)?;
 
     let model = request
         .model
@@ -368,14 +543,15 @@ async fn chat_completions(
         .filter(|model| !model.trim().is_empty())
         .unwrap_or(&state.config.default_model)
         .to_string();
-    let prompt_parts = compile_prompt(&request.messages).map_err(ApiError::invalid_request)?;
+    let prompt_parts =
+        compile_prompt(&request.messages, &tools).map_err(ApiError::invalid_request)?;
     let completion_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
     let created = unix_timestamp();
 
     if request.stream {
-        stream_chat_completion(state, model, prompt_parts, completion_id, created).await
+        stream_chat_completion(state, model, prompt_parts, completion_id, created, &tools).await
     } else {
-        complete_chat_completion(state, model, prompt_parts, completion_id, created).await
+        complete_chat_completion(state, model, prompt_parts, completion_id, created, &tools).await
     }
 }
 
@@ -388,11 +564,6 @@ fn validate_request(request: &ChatCompletionRequest) -> Result<(), ApiError> {
     if request.n.unwrap_or(1) != 1 {
         return Err(ApiError::unsupported("Only n=1 is supported"));
     }
-    if request.tools.is_some() {
-        return Err(ApiError::unsupported(
-            "Tool calling is not supported by this OpenAI-compatible endpoint",
-        ));
-    }
     Ok(())
 }
 
@@ -402,6 +573,7 @@ async fn complete_chat_completion(
     prompt_parts: PromptParts,
     completion_id: String,
     created: u64,
+    tools: &[ToolDefinition],
 ) -> Result<Response, ApiError> {
     let session = create_session(&state, &model, &prompt_parts, false).await?;
     let result = session
@@ -425,6 +597,12 @@ async fn complete_chat_completion(
     let content = assistant_content(&event.data).ok_or_else(|| {
         ApiError::upstream("Copilot returned an assistant message without textual content")
     })?;
+    let tool_calls = parse_tool_calls(&content, tools);
+    let finish_reason = if tool_calls.is_some() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
 
     Ok(Json(ChatCompletionResponse {
         id: completion_id,
@@ -435,9 +613,10 @@ async fn complete_chat_completion(
             index: 0,
             message: AssistantMessage {
                 role: "assistant",
-                content,
+                content: tool_calls.is_none().then_some(content),
+                tool_calls,
             },
-            finish_reason: "stop",
+            finish_reason,
         }],
     })
     .into_response())
@@ -449,7 +628,20 @@ async fn stream_chat_completion(
     prompt_parts: PromptParts,
     completion_id: String,
     created: u64,
+    tools: &[ToolDefinition],
 ) -> Result<Response, ApiError> {
+    if !tools.is_empty() {
+        return stream_tool_chat_completion(
+            state,
+            model,
+            prompt_parts,
+            completion_id,
+            created,
+            tools,
+        )
+        .await;
+    }
+
     let config = session_config(&model, prompt_parts.system_message.clone(), true);
     let prepared = state
         .client
@@ -479,6 +671,39 @@ async fn stream_chat_completion(
         .into_response())
 }
 
+async fn stream_tool_chat_completion(
+    state: AppState,
+    model: String,
+    prompt_parts: PromptParts,
+    completion_id: String,
+    created: u64,
+    tools: &[ToolDefinition],
+) -> Result<Response, ApiError> {
+    let session = create_session(&state, &model, &prompt_parts, false).await?;
+    let (sender, receiver) = mpsc::channel(32);
+    let timeout = state.config.request_timeout;
+    let prompt = prompt_parts.prompt;
+    let tools = tools.to_vec();
+
+    tokio::spawn(async move {
+        stream_tool_session(
+            session,
+            sender,
+            model,
+            prompt,
+            completion_id,
+            created,
+            timeout,
+            tools,
+        )
+        .await;
+    });
+
+    Ok(Sse::new(ReceiverStream::new(receiver))
+        .keep_alive(KeepAlive::default())
+        .into_response())
+}
+
 async fn stream_session(
     session: Session,
     mut events: EventSubscription,
@@ -499,6 +724,7 @@ async fn stream_session(
             delta: AssistantDelta {
                 role: Some("assistant"),
                 content: None,
+                tool_calls: None,
             },
             finish_reason: None,
         }],
@@ -595,6 +821,107 @@ async fn stream_session(
     let _ = session.disconnect().await;
 }
 
+async fn stream_tool_session(
+    session: Session,
+    sender: mpsc::Sender<Result<Event, Infallible>>,
+    model: String,
+    prompt: String,
+    completion_id: String,
+    created: u64,
+    timeout: Duration,
+    tools: Vec<ToolDefinition>,
+) {
+    let role_chunk = ChatCompletionChunk {
+        id: completion_id.clone(),
+        object: "chat.completion.chunk",
+        created,
+        model: model.clone(),
+        choices: vec![ChatCompletionChunkChoice {
+            index: 0,
+            delta: AssistantDelta {
+                role: Some("assistant"),
+                content: None,
+                tool_calls: None,
+            },
+            finish_reason: None,
+        }],
+    };
+    if send_sse_json(&sender, &role_chunk).await.is_err() {
+        let _ = session.disconnect().await;
+        return;
+    }
+
+    let result = session
+        .send_and_wait(MessageOptions::new(prompt).with_wait_timeout(timeout))
+        .await;
+    let _ = session.disconnect().await;
+
+    let content = match result {
+        Ok(Some(event)) => match assistant_content(&event.data) {
+            Some(content) => content,
+            None => {
+                let _ = send_sse_error(
+                    &sender,
+                    "Copilot returned an assistant message without textual content",
+                )
+                .await;
+                return;
+            }
+        },
+        Ok(None) => {
+            let _ = send_sse_error(&sender, "Copilot finished without an assistant response").await;
+            return;
+        }
+        Err(error) if error.to_string().contains("Timeout") => {
+            let _ = send_sse_error(
+                &sender,
+                "The Copilot backend did not finish before the request timeout",
+            )
+            .await;
+            return;
+        }
+        Err(error) => {
+            error!(%error, "Copilot SDK request failed");
+            let _ = send_sse_error(
+                &sender,
+                "The Copilot backend could not complete the request",
+            )
+            .await;
+            return;
+        }
+    };
+
+    if let Some(tool_calls) = parse_tool_calls(&content, &tools) {
+        if send_sse_tool_calls(&sender, &completion_id, created, &model, &tool_calls)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let _ = send_sse_chunk(
+            &sender,
+            &completion_id,
+            created,
+            &model,
+            None,
+            Some("tool_calls"),
+        )
+        .await;
+    } else {
+        let _ = send_sse_chunk(
+            &sender,
+            &completion_id,
+            created,
+            &model,
+            Some(content),
+            Some("stop"),
+        )
+        .await;
+    }
+
+    let _ = sender.send(Ok(Event::default().data("[DONE]"))).await;
+}
+
 async fn create_session(
     state: &AppState,
     model: &str,
@@ -659,8 +986,39 @@ async fn send_sse_chunk(
                 delta: AssistantDelta {
                     role: None,
                     content,
+                    tool_calls: None,
                 },
                 finish_reason,
+            }],
+        },
+    )
+    .await
+}
+
+async fn send_sse_tool_calls(
+    sender: &mpsc::Sender<Result<Event, Infallible>>,
+    completion_id: &str,
+    created: u64,
+    model: &str,
+    tool_calls: &[AssistantToolCall],
+) -> Result<(), ()> {
+    let tool_calls = tool_call_deltas(tool_calls);
+
+    send_sse_json(
+        sender,
+        &ChatCompletionChunk {
+            id: completion_id.to_string(),
+            object: "chat.completion.chunk",
+            created,
+            model: model.to_string(),
+            choices: vec![ChatCompletionChunkChoice {
+                index: 0,
+                delta: AssistantDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: Some(tool_calls),
+                },
+                finish_reason: None,
             }],
         },
     )
@@ -686,7 +1044,10 @@ async fn send_sse_error(
         .map_err(|_| ())
 }
 
-fn compile_prompt(messages: &[ChatMessage]) -> Result<PromptParts, String> {
+fn compile_prompt(
+    messages: &[ChatMessage],
+    tools: &[ToolDefinition],
+) -> Result<PromptParts, String> {
     let mut system_messages = Vec::new();
     let mut conversation = String::from(
         "Continue the following chat conversation. Answer the latest user request directly.\n\n",
@@ -698,8 +1059,24 @@ fn compile_prompt(messages: &[ChatMessage]) -> Result<PromptParts, String> {
 
         match role.as_str() {
             "system" | "developer" => system_messages.push(content),
-            "user" | "assistant" | "tool" => {
-                conversation.push_str(&format!("[{}]\n{}\n\n", role.to_ascii_uppercase(), content));
+            "user" => {
+                conversation.push_str(&format!("[USER]\n{content}\n\n"));
+            }
+            "assistant" => {
+                conversation.push_str(&format!("[ASSISTANT]\n{content}\n\n"));
+                if let Some(tool_calls) = &message.tool_calls {
+                    let tool_calls = serde_json::to_string(tool_calls).map_err(|error| {
+                        format!("Could not encode assistant tool calls: {error}")
+                    })?;
+                    conversation.push_str(&format!("[ASSISTANT TOOL_CALLS]\n{tool_calls}\n\n"));
+                }
+            }
+            "tool" => {
+                let result = json!({
+                    "tool_call_id": message.tool_call_id,
+                    "content": content,
+                });
+                conversation.push_str(&format!("[TOOL RESULT]\n{result}\n\n"));
             }
             _ => return Err(format!("Unsupported message role: {}", message.role)),
         }
@@ -709,11 +1086,27 @@ fn compile_prompt(messages: &[ChatMessage]) -> Result<PromptParts, String> {
         return Err("messages must contain at least one user message".to_string());
     }
 
+    if !tools.is_empty() {
+        system_messages.push(tool_calling_instruction(tools)?);
+    }
+
     conversation.push_str("[ASSISTANT]\n");
     Ok(PromptParts {
         system_message: (!system_messages.is_empty()).then(|| system_messages.join("\n\n")),
         prompt: conversation,
     })
+}
+
+fn tool_calling_instruction(tools: &[ToolDefinition]) -> Result<String, String> {
+    let declarations = serde_json::to_string(tools)
+        .map_err(|error| format!("Could not encode tool declarations: {error}"))?;
+    Ok(format!(
+        "You may request client-side functions, but this service cannot execute them. \
+         When a function is needed, respond with exactly one JSON object and no Markdown or other text: \
+         {{\"tool_calls\":[{{\"name\":\"function_name\",\"arguments\":{{}}}}]}}. \
+         Use only these declared functions, and make each arguments value a JSON object. \
+         If no function is needed, respond normally. Function declarations:\n{declarations}"
+    ))
 }
 
 fn message_content(content: Option<&Value>) -> Result<String, String> {
@@ -769,17 +1162,42 @@ mod tests {
         ChatMessage {
             role: role.to_string(),
             content: Some(content),
+            tool_call_id: None,
+            tool_calls: None,
         }
+    }
+
+    fn declared_tools() -> Vec<ToolDefinition> {
+        let tools: Vec<OpenAiTool> = serde_json::from_value(json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the weather for a city.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                        "required": ["city"]
+                    }
+                }
+            }
+        ]))
+        .expect("test tools should deserialize");
+
+        normalize_tools(Some(&tools)).expect("test tools should normalize")
     }
 
     #[test]
     fn compiles_system_and_conversation_messages() {
-        let prompt = compile_prompt(&[
-            message("system", json!("Be concise.")),
-            message("user", json!("Hello")),
-            message("assistant", json!("Hi")),
-            message("user", json!("Explain Axum")),
-        ])
+        let prompt = compile_prompt(
+            &[
+                message("system", json!("Be concise.")),
+                message("user", json!("Hello")),
+                message("assistant", json!("Hi")),
+                message("user", json!("Explain Axum")),
+            ],
+            &[],
+        )
         .expect("prompt should compile");
 
         assert_eq!(prompt.system_message.as_deref(), Some("Be concise."));
@@ -801,7 +1219,89 @@ mod tests {
 
     #[test]
     fn rejects_unknown_message_roles() {
-        let result = compile_prompt(&[message("function", json!("ignored"))]);
+        let result = compile_prompt(&[message("function", json!("ignored"))], &[]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_only_declared_client_side_tool_calls() {
+        let tools = declared_tools();
+        let calls = parse_tool_calls(
+            r#"{"tool_calls":[{"name":"get_weather","arguments":{"city":"Seattle"}}]}"#,
+            &tools,
+        )
+        .expect("declared tool call should parse");
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].kind, "function");
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments, r#"{"city":"Seattle"}"#);
+        let deltas = tool_call_deltas(&calls);
+        assert_eq!(deltas[0].index, 0);
+        assert_eq!(deltas[0].function.name, "get_weather");
+        let message = serde_json::to_value(AssistantMessage {
+            role: "assistant",
+            content: None,
+            tool_calls: Some(calls),
+        })
+        .expect("tool-call response should serialize");
+        assert!(message["content"].is_null());
+        assert_eq!(message["tool_calls"][0]["type"], "function");
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "get_weather");
+        assert!(
+            parse_tool_calls(
+                r#"{"tool_calls":[{"name":"not_declared","arguments":{}}]}"#,
+                &tools,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn includes_tool_history_and_declarations_in_prompt() {
+        let tools = declared_tools();
+        let messages = vec![
+            message("user", json!("What is the weather in Seattle?")),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![IncomingToolCall {
+                    id: "call_weather".to_string(),
+                    kind: "function".to_string(),
+                    function: IncomingToolFunction {
+                        name: "get_weather".to_string(),
+                        arguments: r#"{"city":"Seattle"}"#.to_string(),
+                    },
+                }]),
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: Some(json!("Rain, 12 C")),
+                tool_call_id: Some("call_weather".to_string()),
+                tool_calls: None,
+            },
+        ];
+
+        let prompt = compile_prompt(&messages, &tools).expect("prompt should compile");
+        assert!(prompt.prompt.contains("[ASSISTANT TOOL_CALLS]"));
+        assert!(prompt.prompt.contains("[TOOL RESULT]"));
+        assert!(prompt.system_message.unwrap().contains("get_weather"));
+    }
+
+    #[test]
+    fn rejects_invalid_tool_parameter_schema() {
+        let tools: Vec<OpenAiTool> = serde_json::from_value(json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "invalid_schema",
+                    "parameters": { "type": "string" }
+                }
+            }
+        ]))
+        .expect("test tool should deserialize");
+
+        assert!(normalize_tools(Some(&tools)).is_err());
     }
 }
