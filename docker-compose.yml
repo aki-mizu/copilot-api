@@ -1,0 +1,23 @@
+services:
+  copilot-openai-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: copilot-openai-api:latest
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${PUBLISHED_PORT:-3000}:3000"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "3000"
+      API_KEY: "${API_KEY:?Set API_KEY in Portainer before deploying}"
+      COPILOT_GITHUB_TOKEN: "${COPILOT_GITHUB_TOKEN:?Set COPILOT_GITHUB_TOKEN in Portainer before deploying}"
+      DEFAULT_MODEL: "${DEFAULT_MODEL:-auto}"
+      REQUEST_TIMEOUT_SECONDS: "${REQUEST_TIMEOUT_SECONDS:-120}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    volumes:
+      - copilot-state:/var/lib/copilot
+
+volumes:
+  copilot-state:
